@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
-Buscador de archivos duplicados - v1
+Buscador de archivos duplicados - v3
 
 Recorre una carpeta (y sus subcarpetas) y encuentra archivos con contenido
-IDENTICO, aunque tengan nombres distintos. Por defecto solo los LISTA; no
-borra nada.
+IDENTICO, aunque tengan nombres distintos. Por defecto solo los LISTA.
 
-Como funciona: calcula el "hash" de cada archivo (una huella digital de su
-contenido). Dos archivos con el mismo contenido dan el mismo hash. Comparar
-hashes es rapido y confiable, no hace falta comparar byte por byte.
+Como funciona:
+  1. Agrupa los archivos por TAMAÑO (dato gratis, el sistema ya lo sabe).
+  2. Solo hashea los que comparten tamaño con otro: si un tamaño es unico,
+     ese archivo no puede tener duplicado, y no hace falta leerlo. Asi se
+     evita hashear casi todos los archivos -> mucho mas rapido.
+  3. Agrupa por hash los que quedaron: mismo hash = mismo contenido.
+
+Al borrar, podés elegir CUAL copia conservar de cada grupo (--conservar).
 
 Uso:
-    python3 buscar_duplicados.py                  # busca en ~/Descargas
-    python3 buscar_duplicados.py ~/Imagenes       # en otra carpeta
-    python3 buscar_duplicados.py ~/fotos --borrar # listar y OFRECER borrar
+    python3 buscar_duplicados.py                      # busca en ~/Descargas
+    python3 buscar_duplicados.py ~/Imagenes           # en otra carpeta
+    python3 buscar_duplicados.py ~/fotos --borrar     # listar y ofrecer borrar
+    python3 buscar_duplicados.py ~/fotos --borrar --conservar antiguo
 """
 
 import hashlib
@@ -29,15 +34,17 @@ def parsear_args():
     p.add_argument("carpeta", nargs="?", default=str(Path.home() / "Descargas"),
                    help="carpeta donde buscar (default: ~/Descargas)")
     p.add_argument("--borrar", action="store_true",
-                   help="despues de listar, ofrece borrar las copias (deja una)")
+                   help="despues de listar, ofrece borrar las copias")
+    p.add_argument("--conservar", choices=["primero", "corto", "antiguo", "nuevo"],
+                   default="primero",
+                   help="cual copia conservar de cada grupo al borrar "
+                        "(primero=como aparece, corto=nombre mas corto, "
+                        "antiguo=mas viejo, nuevo=mas reciente). Default: primero")
     return p.parse_args()
 
 
 def hash_archivo(ruta, bloque=65536):
-    """
-    Calcula el hash SHA-256 del contenido de un archivo.
-    Lo lee de a bloques (64 KB) para no cargar archivos enormes enteros en RAM.
-    """
+    """Calcula el hash SHA-256 del contenido, leyendo de a bloques."""
     h = hashlib.sha256()
     with open(ruta, "rb") as f:
         while True:
@@ -46,6 +53,48 @@ def hash_archivo(ruta, bloque=65536):
                 break
             h.update(datos)
     return h.hexdigest()
+
+
+def agrupar_duplicados(base):
+    """
+    Devuelve una lista de grupos; cada grupo es una lista de archivos identicos.
+    Optimizacion: solo hashea archivos que comparten tamaño con otro.
+    """
+    # Paso 1: agrupar por tamaño (gratis)
+    por_tamano = defaultdict(list)
+    for archivo in base.rglob("*"):
+        if archivo.is_file():
+            try:
+                por_tamano[archivo.stat().st_size].append(archivo)
+            except (PermissionError, OSError):
+                continue
+
+    # Paso 2 y 3: solo hashear los tamaños que tienen 2+ archivos
+    por_hash = defaultdict(list)
+    hasheados = 0
+    for tamano, archivos in por_tamano.items():
+        if len(archivos) < 2:
+            continue                     # tamaño unico: no puede haber duplicado
+        for archivo in archivos:
+            try:
+                por_hash[hash_archivo(archivo)].append(archivo)
+                hasheados += 1
+            except (PermissionError, OSError):
+                continue
+
+    grupos = [arch for arch in por_hash.values() if len(arch) > 1]
+    return grupos, hasheados
+
+
+def conservar_de(grupo, criterio):
+    """Devuelve el archivo del grupo que hay que CONSERVAR, segun el criterio."""
+    if criterio == "corto":
+        return min(grupo, key=lambda a: len(a.name))
+    if criterio == "antiguo":
+        return min(grupo, key=lambda a: a.stat().st_mtime)
+    if criterio == "nuevo":
+        return max(grupo, key=lambda a: a.stat().st_mtime)
+    return grupo[0]                      # "primero"
 
 
 def main():
@@ -58,46 +107,40 @@ def main():
 
     print(f"Buscando duplicados en: {base}\n")
 
-    # Agrupamos archivos por su hash. Los que caigan en el mismo grupo son copias.
-    por_hash = defaultdict(list)
-    for archivo in base.rglob("*"):   # rglob = recorre tambien subcarpetas
-        if archivo.is_file():
-            try:
-                por_hash[hash_archivo(archivo)].append(archivo)
-            except (PermissionError, OSError):
-                # archivo que no se puede leer: lo salteamos sin cortar todo
-                continue
-
-    # Nos quedan solo los grupos con mas de un archivo (los duplicados)
-    grupos = [archivos for archivos in por_hash.values() if len(archivos) > 1]
+    grupos, hasheados = agrupar_duplicados(base)
 
     if not grupos:
-        print("No se encontraron duplicados.")
+        print(f"No se encontraron duplicados. (Se hashearon solo {hasheados} archivos.)")
         return
 
     espacio_recuperable = 0
-    for i, archivos in enumerate(grupos, 1):
-        tam = archivos[0].stat().st_size
-        copias = len(archivos) - 1          # una se conserva, el resto son copias
-        espacio_recuperable += tam * copias
-        print(f"Grupo {i} ({len(archivos)} iguales, {tam} bytes c/u):")
-        for a in archivos:
-            print(f"    {a}")
+    for i, grupo in enumerate(grupos, 1):
+        tam = grupo[0].stat().st_size
+        espacio_recuperable += tam * (len(grupo) - 1)
+        conservado = conservar_de(grupo, args.conservar)
+        print(f"Grupo {i} ({len(grupo)} iguales, {tam} bytes c/u):")
+        for a in grupo:
+            marca = "  [CONSERVAR]" if a == conservado else "  [copia]    "
+            print(f"  {marca} {a}")
         print()
 
-    print(f"{len(grupos)} grupo(s) de duplicados.")
-    print(f"Espacio recuperable si borrás las copias: {espacio_recuperable} bytes "
+    print(f"{len(grupos)} grupo(s) de duplicados. "
+          f"(Optimizacion: solo se hashearon {hasheados} archivos.)")
+    print(f"Espacio recuperable: {espacio_recuperable} bytes "
           f"({espacio_recuperable / 1_000_000:.1f} MB)")
+    print(f"Criterio para conservar: {args.conservar}")
 
     if args.borrar:
-        print("\n--borrar activado: de cada grupo se conserva el PRIMERO y se borran las copias.")
+        print("\nSe conserva el marcado [CONSERVAR] en cada grupo y se borra el resto.")
         resp = input("¿Seguro? Escribí 'si' para confirmar: ").strip().lower()
         if resp == "si":
             borrados = 0
-            for archivos in grupos:
-                for copia in archivos[1:]:   # salteamos el primero (el que se queda)
-                    copia.unlink()
-                    borrados += 1
+            for grupo in grupos:
+                conservado = conservar_de(grupo, args.conservar)
+                for copia in grupo:
+                    if copia != conservado:
+                        copia.unlink()
+                        borrados += 1
             print(f"Listo. {borrados} copia(s) borrada(s).")
         else:
             print("Cancelado. No se borró nada.")
